@@ -6,15 +6,16 @@ import subprocess
 import systemd.daemon
 import sys
 import signal
+from threading import Thread
 
 # Global variables
 
-chat_id = 0
-TOKEN = "<TOKEN>"
+chat_id = 123456
+TOKEN = "123456"
 
 # chat_id = 0
 # TOKEN = "<TOKEN>"
-get_url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?timeout=5&offset="
+get_url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?timeout=2&offset="
 send_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={chat_id}&text="
 update_id = 0
 _exit = False
@@ -22,9 +23,21 @@ FAILED_TO_START = False
 
 # Define what to do based on systemd signals
 def term_signal_handler(signal, frame):
+    systemd.daemon.notify('STOPPING=1')
     _exit = True
     _send("♻Rebooting Server")
 
+# Check if container is ok
+def wait_for_docker(container : str, text : str):
+    retry_count = 120
+    while retry_count > 0:
+        status = subprocess.check_output(f"docker logs {container}", shell=True, text=True)
+        if text in status:
+            return True
+        else:
+            time.sleep(1)
+            retry_count -= 1
+    return False
 
 # Send a mesage
 def _send(message):
@@ -50,13 +63,11 @@ def help():
 
 def exit():
     global _exit
+    systemd.daemon.notify('STOPPING=1')
     _exit = True
-    _send("📛Server Stopping")
-    signal.pause()
-    sys.exit(0)
+    _send("Preparing to stop...")
 
 def reboot():
-    _send("♻Rebooting Server")
     os.system("reboot")
 
 def ip():
@@ -84,66 +95,8 @@ def dobackup():
 def todo():
     _send("🚧TODO")
 
-# Collect all commands for parsing
-commands = {"/help"   : help,
-            "/status" : status,
-            "/backup" : dobackup,
-            "/ip"     : ip,
-            "/unban"  : todo,
-            "/stop"   : todo,
-            "/exit"   : exit,
-            "/reboot" : reboot
-            }
-
-
-########################################
-##          SERVER START              ##
-########################################
-print("Starting SERVER")
-
-# Start message
-_send("🚀Server Starting...")
-
-signal.signal(signal.SIGTERM, term_signal_handler)
-# Empty  incoming telegram message queue
-response = requests.get(f"{get_url}{update_id}").json()
-if len(response["result"]) > 0:
-    # Increment update counter to discard previous messages
-    update_id = int(response["result"][0]["update_id"]) + 1
-print("Message queue emptyed")
-
-# Check RAID status
-raid_status = subprocess.check_output("mdadm -D /dev/md0 | grep \"State :\"", shell=True, text=True)
-if "clean" not in raid_status:
-    FAILED_TO_START = True
-    _send("🚨Failed to start RAID!")
-print("Raid status checked")
-
-# TODO: Check IMMICH, NGNIX, VAULTWARDEN STATUS
-# Check if Immich staerted on local network
-immich_retry_cout = 120
-immich_ok = False
-while immich_retry_cout > 0:
-    immich_status = subprocess.check_output("wget --server-response 192.168.0.253:2283 2>&1 | awk '/^  HTTP/{print $2}'", shell=True, text=True)
-    print(f"Immich_status: {immich_status}")
-    if "200" in immich_status:
-        immich_ok = True
-        immich_retry_cout = 0
-    else:
-        immich_retry_cout -= 1
-if not immich_ok:
-    FAILED_TO_START = True
-    _send("🚨Failed to start Immich!")
-print("Immich status checked")
-
-# Server finished starting:
-if not FAILED_TO_START:
-    _send("✅Server Started!")
-systemd.daemon.notify('READY=1')
-
-print("Starting main loop")
-# Main loop
-while not _exit:
+def tick():
+    global update_id, get_url
     response = requests.get(f"{get_url}{update_id}").json()
     # Check if the response actually contains any results
     if len(response["result"]) > 0:
@@ -161,4 +114,81 @@ while not _exit:
             except Exception as e:
                 exc = type(e).__name__
                 _send(f"{exc}")
-signal.pause()
+
+def main_loop():
+    global _exit
+    while not _exit:
+        systemd.daemon.notify('WATCHDOG=1')
+        tick()
+        time.sleep(1)
+
+
+
+# Collect all commands for parsing
+commands = {"/help"   : help,
+            "/status" : status,
+            "/backup" : dobackup,
+            "/ip"     : ip,
+            "/unban"  : todo,
+            "/stop"   : todo,
+            "/exit"   : exit,
+            "/reboot" : reboot
+            }
+
+
+########################################
+##          SERVER START              ##
+########################################
+if __name__ == "__main__":
+    print("Starting SERVER")
+
+    # Start message
+    _send("🚀Server Starting...")
+
+    signal.signal(signal.SIGTERM, term_signal_handler)
+    signal.signal(signal.SIGINT, term_signal_handler)
+
+
+
+    # Empty  incoming telegram message queue
+    response = requests.get(f"{get_url}{update_id}").json()
+    if len(response["result"]) > 0:
+        # Increment update counter to discard previous messages
+        update_id = int(response["result"][0]["update_id"]) + 1
+    print("Message queue emptyed")
+
+    systemd.daemon.notify('READY=1')
+    main_thread = Thread(target=main_loop)
+
+    # Check RAID status
+    raid_status = subprocess.check_output("mdadm -D /dev/md0 | grep \"State :\"", shell=True, text=True)
+    if "clean" not in raid_status:
+        FAILED_TO_START = True
+        _send("🚨Failed to start RAID!")
+
+    # Check if Immich started on local network
+    # if not wait_for_docker("immich_server", "Immich Server is listening on"):
+    #     FAILED_TO_START = True
+    #    _send("🚨Failed to start Immich!")
+
+    # Check if NGINX started on local network
+    # if not wait_for_docker("ngnixporxy-app-1", "listening on port 3000"):
+    #     FAILED_TO_START = True
+    #     _send("🚨Failed to start Nginx!")
+
+    # Check if Vaultwarden started on local network
+    # if not wait_for_docker("vaultwarden", "Rocket has launched from http://0.0.0.0:80"):
+    #    FAILED_TO_START = True
+    #    _send("🚨Failed to start Vaultwarden!")
+
+
+    # Server finished starting:
+    if not FAILED_TO_START:
+        _send("✅Server Started!")
+
+    print("Starting main loop")
+    # Main loop
+    main_thread.start()
+    main_thread.join()
+    _send("Bye")
+    exit()
